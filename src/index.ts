@@ -3,8 +3,10 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
+	contextTokenLimits,
 	residentTokenEstimate,
 	selectContext,
+	type ContextSelection,
 	type ResidentToolDefinition,
 } from "./context-policy.ts";
 import { ContextUsageTracker } from "./context-usage.ts";
@@ -66,6 +68,28 @@ function persistentSessionMessages(ctx: ExtensionContext): AgentMessage[] {
 }
 
 type BranchEdits = { invalidating: string[]; omittedFailures: string[] };
+type RotateCommand = { kind: "none" } | { kind: "invalid" } | { kind: "rotate"; trimToTokens?: number };
+
+const COMMAND_USAGE = "Usage: /context-paging [on|off|rotate [tokens]|status|stats]";
+
+function parseRotateCommand(action: string): RotateCommand {
+	const parts = action.split(/\s+/u);
+	if (parts[0] !== "rotate") return { kind: "none" };
+	if (parts.length === 1) return { kind: "rotate" };
+	if (parts.length > 2 || !/^[1-9]\d*$/u.test(parts[1]!)) return { kind: "invalid" };
+	const trimToTokens = Number(parts[1]!);
+	return Number.isSafeInteger(trimToTokens) ? { kind: "rotate", trimToTokens } : { kind: "invalid" };
+}
+
+/** Reports what a consumed rotation did, because the queue notice cannot know whether the cut will move. */
+function rotationOutcome(selection: ContextSelection): { message: string; level: "info" | "warning" } {
+	if (selection.advanced) {
+		const tokens = selection.estimatedTokens.toLocaleString("en-US");
+		return { message: `Context paging rotated to ${tokens} tokens.`, level: "info" };
+	}
+	const reason = selection.cutFallbackReason ?? "context is already below the rotation target";
+	return { message: `Context paging skipped the rotation: ${reason}.`, level: "warning" };
+}
 
 /** Separates history-changing edits from Pi retry edits that omit failed responses no request sent. */
 function branchEdits(branch: readonly SessionEntry[]): BranchEdits {
@@ -101,11 +125,13 @@ export default function contextPagingExtension(
 	const usageTracker = new ContextUsageTracker();
 	const cutState = new ContextCutState();
 	let latestInput: InputTokenCount | undefined;
+	let pendingRotation: { trimToTokens?: number } | undefined;
 	const warnedSettingPairs = new Set<string>();
 	const resetPagingState = () => {
 		usageTracker.clear();
 		cutState.reset();
 		latestInput = undefined;
+		pendingRotation = undefined;
 	};
 	const warnAboutTrimTarget = (ctx: ExtensionContext) => {
 		const { tokenBudget, trimToTokens, trimToTokensExplicit } = resolvedSettings;
@@ -168,7 +194,7 @@ export default function contextPagingExtension(
 	};
 
 	pi.registerCommand("context-paging", {
-		description: "Enable or disable context paging for this session, or show status and stats",
+		description: "Enable, disable, or rotate context paging for this session, or show status and stats",
 		handler: async (args, ctx) => {
 			const action = args.trim();
 			if (action === "stats") {
@@ -179,13 +205,44 @@ export default function contextPagingExtension(
 				}
 				return;
 			}
+			const rotateCommand = parseRotateCommand(action);
+			if (rotateCommand.kind === "invalid") {
+				ctx.ui.notify(COMMAND_USAGE, "warning");
+				return;
+			}
+			if (rotateCommand.kind === "rotate") {
+				if (!isEnabled()) {
+					ctx.ui.notify("Context paging is disabled for this session.", "warning");
+					return;
+				}
+				const { tokenBudget } = resolvedSettings;
+				const requested = rotateCommand.trimToTokens ?? resolvedSettings.trimToTokens;
+				// selectContext caps the target at the budget, so a target at or above it would rotate nothing.
+				if (tokenBudget <= requested) {
+					ctx.ui.notify(`Rotation target must be below the ${tokenBudget.toLocaleString("en-US")}-token budget.`, "warning");
+					return;
+				}
+				let effective: number;
+				try {
+					// A model window below tokenBudget scales the target down, so we show the target selection will use.
+					effective = contextTokenLimits({
+						tokenBudget, trimToTokens: requested, modelContextWindow: ctx.model?.contextWindow,
+					}).trimToTokens;
+				} catch (error) {
+					ctx.ui.notify(`Context paging cannot rotate: ${errorMessage(error)}`, "warning");
+					return;
+				}
+				pendingRotation = { trimToTokens: rotateCommand.trimToTokens };
+				ctx.ui.notify(`Context paging will rotate to ${effective.toLocaleString("en-US")} tokens on the next request.`, "info");
+				return;
+			}
 			if (action === "on" || action === "off") {
 				const enabled = action === "on";
 				if (enabled !== isEnabled()) resetPagingState();
 				sessionEnabled = enabled;
 				publishStatus(ctx);
 			} else if (action !== "" && action !== "status") {
-				ctx.ui.notify("Usage: /context-paging [on|off|status|stats]", "warning");
+				ctx.ui.notify(COMMAND_USAGE, "warning");
 				return;
 			}
 			ctx.ui.notify(`Context paging is ${isEnabled() ? "enabled" : "disabled"} for this session.`, "info");
@@ -248,6 +305,8 @@ export default function contextPagingExtension(
 			ctx.ui.notify(`Context paging history is unavailable: ${errorMessage(error)}`, "error");
 		}
 
+		// The rotation stays queued until selection succeeds, so an aborted provider call does not lose it.
+		const rotation = pendingRotation;
 		try {
 			const systemPrompt = ctx.getSystemPrompt();
 			const activeTools = activeResidentTools(pi);
@@ -264,7 +323,8 @@ export default function contextPagingExtension(
 				activeTools,
 				modelContextWindow: ctx.model?.contextWindow,
 				tokenBudget: resolvedSettings.tokenBudget,
-				trimToTokens: resolvedSettings.trimToTokens,
+				trimToTokens: rotation?.trimToTokens ?? resolvedSettings.trimToTokens,
+				rotate: rotation !== undefined,
 				cutState: cutState.prepare(rawHistoryItems),
 				contextTokens,
 				tokenEstimates: usageTracker.tokenEstimates,
@@ -274,6 +334,12 @@ export default function contextPagingExtension(
 			// Unknown canonical provenance is an empty trusted subset, never the outgoing request.
 			usageTracker.recordSelection(selection.messages, residentTokens, canonicalSessionMessages ?? []);
 			cutState.commit(selection.cutState);
+			if (rotation) {
+				// Cleared alongside the commit: this handler is synchronous, so later tool calls in the turn do not rotate again.
+				pendingRotation = undefined;
+				const outcome = rotationOutcome(selection);
+				ctx.ui.notify(outcome.message, outcome.level);
+			}
 			latestInput = { tokens: selection.estimatedTokens, estimated: true };
 			return { messages: selection.messages };
 		} catch (error) {
