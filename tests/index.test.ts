@@ -935,6 +935,19 @@ test("context-paging rotate reports its outcome and keeps a rotation queued acro
 	assert.match(harness.notifications.at(-1)!.message, /skipped the rotation: context is already below/);
 });
 
+test("context-paging rotate does not claim the context is below the target when nothing older can be evicted", async () => {
+	const harness = createHarness({ globalSettings: { contextPaging: { enabled: true, tokenBudget: 1_000 } }, projectTrusted: false });
+	const messages = [user(`ROTATE_ACTIVE ${"x".repeat(2_400)}`)];
+	harness.setBranch(messages.map((message, index) => entry(`rotate-${index}`, message)));
+	harness.ctx.getSystemPrompt = () => "system";
+
+	await runPagingCommand(harness, "rotate 50");
+	const selected = await emit(harness, "context", { messages }) as any;
+	assert.equal(hasMarker(selected.messages, "ROTATE_ACTIVE"), true);
+	assert.equal(harness.notifications.at(-1)!.level, "warning");
+	assert.match(harness.notifications.at(-1)!.message, /skipped the rotation: nothing older can be evicted/);
+});
+
 test("context-paging rotate rejects targets at or above the budget and shows the model-scaled target", async () => {
 	const { harness, messages } = resetFixture();
 	harness.ctx.getSystemPrompt = () => "system";

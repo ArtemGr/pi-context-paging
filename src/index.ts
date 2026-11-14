@@ -82,12 +82,14 @@ function parseRotateCommand(action: string): RotateCommand {
 }
 
 /** Reports what a consumed rotation did, because the queue notice cannot know whether the cut will move. */
-function rotationOutcome(selection: ContextSelection): { message: string; level: "info" | "warning" } {
+function rotationOutcome(selection: ContextSelection, targetTokens: number): { message: string; level: "info" | "warning" } {
 	if (selection.advanced) {
 		const tokens = selection.estimatedTokens.toLocaleString("en-US");
 		return { message: `Context paging rotated to ${tokens} tokens.`, level: "info" };
 	}
-	const reason = selection.cutFallbackReason ?? "context is already below the rotation target";
+	// An unmoved cut above the target means only the active request or a protected exchange remains.
+	const reason = selection.cutFallbackReason ?? (selection.estimatedTokens > targetTokens
+		? "nothing older can be evicted" : "context is already below the rotation target");
 	return { message: `Context paging skipped the rotation: ${reason}.`, level: "warning" };
 }
 
@@ -317,13 +319,16 @@ export default function contextPagingExtension(
 			const contextTokens = usageTracker.prepare(
 				event.messages, residentTokens, ctx.getContextUsage()?.tokens, canonicalSessionMessages ?? [],
 			);
+			const selectionLimits = {
+				modelContextWindow: ctx.model?.contextWindow,
+				tokenBudget: resolvedSettings.tokenBudget,
+				trimToTokens: rotation?.trimToTokens ?? resolvedSettings.trimToTokens,
+			};
 			const selection = selectContext({
 				messages: event.messages,
 				systemPrompt,
 				activeTools,
-				modelContextWindow: ctx.model?.contextWindow,
-				tokenBudget: resolvedSettings.tokenBudget,
-				trimToTokens: rotation?.trimToTokens ?? resolvedSettings.trimToTokens,
+				...selectionLimits,
 				rotate: rotation !== undefined,
 				cutState: cutState.prepare(rawHistoryItems),
 				contextTokens,
@@ -337,7 +342,7 @@ export default function contextPagingExtension(
 			if (rotation) {
 				// Cleared alongside the commit: this handler is synchronous, so later tool calls in the turn do not rotate again.
 				pendingRotation = undefined;
-				const outcome = rotationOutcome(selection);
+				const outcome = rotationOutcome(selection, contextTokenLimits(selectionLimits).trimToTokens);
 				ctx.ui.notify(outcome.message, outcome.level);
 			}
 			latestInput = { tokens: selection.estimatedTokens, estimated: true };
