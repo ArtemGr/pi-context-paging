@@ -132,12 +132,16 @@ export default function contextPagingExtension(
 	let latestInput: InputTokenCount | undefined;
 	let pendingRotation: { trimToTokens?: number } | undefined;
 	const warnedSettingPairs = new Set<string>();
-	const resetPagingState = () => {
+	const resetModelAccounting = () => {
 		usageTracker.clear();
+		latestInput = undefined;
+	};
+	// messageCosts and projectionWatermark hold model-independent estimates and projections, so they reset here only.
+	const resetPagingState = () => {
+		resetModelAccounting();
 		cutState.reset();
 		messageCosts.clear();
 		projectionWatermark = undefined;
-		latestInput = undefined;
 		pendingRotation = undefined;
 	};
 	const warnAboutTrimTarget = (ctx: ExtensionContext) => {
@@ -292,8 +296,10 @@ export default function contextPagingExtension(
 		omittedFailureEntries = new Set();
 		refreshSafely(ctx, true);
 	});
+	// A model switch invalidates tokenizer calibration, not the session's paged prefix or a pending user rotation:
+	// un-cutting evicted history on model_select re-sends old context onto the new model's cold cache.
 	pi.on("model_select", () => {
-		resetPagingState();
+		resetModelAccounting();
 	});
 	pi.on("session_compact", (event) => {
 		const id = event.compactionEntry?.id;

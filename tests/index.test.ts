@@ -985,7 +985,7 @@ test("context-paging rotate rejects disabled sessions, bad targets, and clears a
 		assert.match(disabled.harness.notifications.at(-1)!.message, /Usage:.*rotate/);
 	}
 
-	for (const reset of ["session_tree", "model_select", "session_compact"] as const) {
+	for (const reset of ["session_tree", "session_compact"] as const) {
 		const { harness, messages } = resetFixture();
 		harness.ctx.getSystemPrompt = () => "system";
 		await runPagingCommand(harness, "rotate");
@@ -993,6 +993,14 @@ test("context-paging rotate rejects disabled sessions, bad targets, and clears a
 		const afterReset = await emit(harness, "context", { messages }) as any;
 		assert.equal(hasMarker(afterReset.messages, "RESET_A request"), true);
 	}
+
+	const acrossModel = resetFixture();
+	acrossModel.harness.ctx.getSystemPrompt = () => "system";
+	await runPagingCommand(acrossModel.harness, "rotate");
+	await emit(acrossModel.harness, "model_select", { model: acrossModel.harness.ctx.model });
+	const rotatedAfterSwitch = await emit(acrossModel.harness, "context", { messages: acrossModel.messages }) as any;
+	assert.equal(hasMarker(rotatedAfterSwitch.messages, "RESET_A request"), false);
+	assert.equal(hasMarker(rotatedAfterSwitch.messages, "RESET_C request"), true);
 });
 
 test("context-paging resets its override at every session start", async () => {
@@ -1193,24 +1201,25 @@ for (const [name, event] of [
 	});
 }
 
-test("model switches reset the frontier in both window-size directions", async (t) => {
+test("model switches preserve a committed frontier and still advance for smaller windows", async (t) => {
 	const commits = t.mock.method(ContextCutState.prototype, "commit");
 	const harness = createHarness({ globalSettings: { contextPaging: { tokenBudget: 128_000 } }, projectTrusted: false });
 	const messages = ["WINDOW_A", "WINDOW_B", "WINDOW_C"].flatMap((id) => [user(id), assistant(`${id} ${"x".repeat(240_000)}`)]);
 	messages.push(user("WINDOW_ACTIVE"));
 	harness.setBranch(messages.map((message, index) => entry(`window-${index}`, message)));
+	harness.ctx.model.contextWindow = 128_000;
+	const initialLarge = await emit(harness, "context", { messages: structuredClone(messages) }) as any;
+	assert.equal(hasMarker(initialLarge.messages, "WINDOW_C"), true);
+	harness.ctx.model.contextWindow = 48_000;
+	await emit(harness, "model_select", { model: harness.ctx.model });
 	const small = await emit(harness, "context", { messages }) as any;
 	assert.ok(commits.mock.calls.at(-1)?.arguments[0]);
 	assert.equal(hasMarker(small.messages, "WINDOW_C"), false);
 	harness.ctx.model.contextWindow = 128_000;
 	await emit(harness, "model_select", { model: harness.ctx.model });
-	const large = await emit(harness, "context", { messages: structuredClone(messages) }) as any;
-	assert.equal(hasMarker(large.messages, "WINDOW_C"), true);
-	harness.ctx.model.contextWindow = 64_000;
-	await emit(harness, "model_select", { model: harness.ctx.model });
-	const smallAgain = await emit(harness, "context", { messages: structuredClone(messages) }) as any;
-	assert.equal(hasMarker(smallAgain.messages, "WINDOW_C"), false);
-	assert.equal(hasMarker(smallAgain.messages, "WINDOW_ACTIVE"), true);
+	const largeAfterCut = await emit(harness, "context", { messages: structuredClone(messages) }) as any;
+	assert.equal(hasMarker(largeAfterCut.messages, "WINDOW_C"), false);
+	assert.equal(hasMarker(largeAfterCut.messages, "WINDOW_ACTIVE"), true);
 	assert.equal(harness.abortCalls(), 0);
 });
 
