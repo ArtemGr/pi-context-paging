@@ -251,7 +251,13 @@ export default function contextPagingExtension(
 			}
 			if (action === "on" || action === "off") {
 				const enabled = action === "on";
-				if (enabled !== isEnabled()) resetPagingState();
+				// Off/on keeps the cut, as a model switch does: flipping through an unpaged model back to a paged one then
+				// re-sends the prefix that model's cache still holds. A disabled session skips the context hook, so its
+				// accounting is stale, and turning paging on drops a rotation queued before it.
+				if (enabled !== isEnabled()) {
+					resetModelAccounting();
+					pendingRotation = undefined;
+				}
 				sessionEnabled = enabled;
 				publishStatus(ctx);
 			} else if (action !== "" && action !== "status") {

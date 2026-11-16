@@ -862,7 +862,7 @@ test("context-paging rejects invalid arguments without changing state or a commi
 	assert.equal(await emit(harness, "context", { messages }), undefined);
 });
 
-test("context-paging preserves a cut for status and repeated on but resets it across off/on", async () => {
+test("context-paging preserves a cut for status, repeated on, and off/on", async () => {
 	const { harness, messages } = resetFixture();
 	const first = await emit(harness, "context", { messages }) as any;
 	assert.equal(hasMarker(first.messages, "RESET_A request"), false);
@@ -875,8 +875,7 @@ test("context-paging preserves a cut for status and repeated on but resets it ac
 	await runPagingCommand(harness, "off");
 	await runPagingCommand(harness, "on");
 	const restored = await emit(harness, "context", { messages }) as any;
-	assert.equal(hasMarker(restored.messages, "RESET_A request"), true);
-	assert.equal(hasNotice(restored.messages), false);
+	assert.deepEqual(restored.messages, first.messages);
 });
 
 test("context-paging rotate advances the cut on the next request and supports an explicit token target", async () => {
